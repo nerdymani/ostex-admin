@@ -29,30 +29,54 @@ function checkRequirements(): array {
 // ── Handle form posts ────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($step === 'configure') {
-        $fields = ['APP_NAME','APP_URL','DB_HOST','DB_PORT','DB_DATABASE','DB_USERNAME','DB_PASSWORD',
-                   'ADMIN_EMAIL','ADMIN_PASSWORD'];
-        $env = file_get_contents($envExample);
-        foreach ($fields as $f) {
-            $val = $_POST[$f] ?? '';
-            $val = addslashes($val);
-            $env = preg_replace('/^' . $f . '=.*/m', $f . '="' . $val . '"', $env);
-        }
-        file_put_contents($envPath, $env);
 
-        // Run artisan commands
-        $output = [];
-        chdir($root);
-        exec('php artisan key:generate --force 2>&1', $output);
-        exec('php artisan migrate --force 2>&1', $output);
-        exec('php artisan db:seed --force 2>&1', $output);
-        exec('php artisan storage:link 2>&1', $output);
-
-        $imploded = implode("\n", $output);
-        if (strpos($imploded, 'error') !== false || strpos($imploded, 'Error') !== false) {
-            $error = htmlspecialchars($imploded);
+        if (!function_exists('exec') || !is_callable('exec')) {
+            $error = 'The exec() function is disabled on this server. Please enable it in php.ini to run the installer.';
+        } elseif (!file_exists($envExample)) {
+            $error = '.env.example file not found. Please make sure it exists in the project root.';
         } else {
-            header('Location: ?step=success');
-            exit;
+            $fields = ['APP_NAME','APP_URL','DB_HOST','DB_PORT','DB_DATABASE','DB_USERNAME','DB_PASSWORD',
+                       'ADMIN_EMAIL','ADMIN_PASSWORD'];
+            $env = file_get_contents($envExample);
+
+            foreach ($fields as $f) {
+                $val = $_POST[$f] ?? '';
+                // Escape double quotes for .env format
+                $val = str_replace('"', '\\"', $val);
+                if (preg_match('/^' . $f . '=/m', $env)) {
+                    $env = preg_replace('/^' . $f . '=.*/m', $f . '="' . $val . '"', $env);
+                } else {
+                    $env .= "\n" . $f . '="' . $val . '"';
+                }
+            }
+
+            if (file_put_contents($envPath, $env) === false) {
+                $error = 'Could not write .env file. Please check write permissions on the project root.';
+            } else {
+                // Detect the PHP binary used by this process
+                $phpBin = PHP_BINARY ?: 'php';
+
+                chdir($root);
+                $output = [];
+                $exitCode = 0;
+
+                exec('"' . $phpBin . '" artisan key:generate --force 2>&1', $output, $exitCode);
+                exec('"' . $phpBin . '" artisan migrate --force 2>&1', $output, $exitCode);
+                exec('"' . $phpBin . '" artisan db:seed --force 2>&1', $output, $exitCode);
+                exec('"' . $phpBin . '" artisan storage:link 2>&1', $output, $exitCode);
+
+                $imploded = implode("\n", $output);
+
+                // Check for genuine failures (exit code non-zero or fatal error keywords)
+                if ($exitCode !== 0 || stripos($imploded, 'fatal') !== false || stripos($imploded, 'exception') !== false) {
+                    $error = htmlspecialchars($imploded);
+                } else {
+                    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                    $host   = $_SERVER['HTTP_HOST'];
+                    header('Location: ' . $scheme . '://' . $host . '/install/?step=success');
+                    exit;
+                }
+            }
         }
     }
 }
