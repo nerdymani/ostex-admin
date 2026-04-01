@@ -4,84 +4,90 @@
  * Visit: http://yourdomain.com/install/
  */
 
-$root = dirname(dirname(__DIR__));
-$envPath = $root . '/.env';
+$root       = dirname(dirname(__DIR__));
+$envPath    = $root . '/.env';
 $envExample = $root . '/.env.example';
 
-$step = $_GET['step'] ?? 'requirements';
-$message = '';
+$step  = $_GET['step'] ?? 'requirements';
 $error = '';
 
-// ── Requirements ────────────────────────────────────────────
-function checkRequirements(): array {
+// ── Requirements ─────────────────────────────────────────────
+function checkRequirements(string $envPath): array {
     return [
-        ['PHP >= 8.2', version_compare(PHP_VERSION, '8.2.0', '>='), PHP_VERSION],
-        ['PDO MySQL', extension_loaded('pdo_mysql'), extension_loaded('pdo_mysql') ? 'OK' : 'Missing'],
-        ['OpenSSL', extension_loaded('openssl'), extension_loaded('openssl') ? 'OK' : 'Missing'],
-        ['Mbstring', extension_loaded('mbstring'), extension_loaded('mbstring') ? 'OK' : 'Missing'],
-        ['Tokenizer', extension_loaded('tokenizer'), extension_loaded('tokenizer') ? 'OK' : 'Missing'],
-        ['JSON', extension_loaded('json'), extension_loaded('json') ? 'OK' : 'Missing'],
-        ['Fileinfo', extension_loaded('fileinfo'), extension_loaded('fileinfo') ? 'OK' : 'Missing'],
-        ['.env writable', is_writable(dirname($GLOBALS['envPath'])), is_writable(dirname($GLOBALS['envPath'])) ? 'OK' : 'Not writable'],
+        ['PHP >= 8.2',   version_compare(PHP_VERSION, '8.2.0', '>='), PHP_VERSION],
+        ['PDO MySQL',    extension_loaded('pdo_mysql'),  extension_loaded('pdo_mysql')  ? 'OK' : 'Missing'],
+        ['OpenSSL',      extension_loaded('openssl'),    extension_loaded('openssl')    ? 'OK' : 'Missing'],
+        ['Mbstring',     extension_loaded('mbstring'),   extension_loaded('mbstring')   ? 'OK' : 'Missing'],
+        ['Tokenizer',    extension_loaded('tokenizer'),  extension_loaded('tokenizer')  ? 'OK' : 'Missing'],
+        ['JSON',         extension_loaded('json'),       extension_loaded('json')       ? 'OK' : 'Missing'],
+        ['Fileinfo',     extension_loaded('fileinfo'),   extension_loaded('fileinfo')   ? 'OK' : 'Missing'],
+        ['.env writable', is_writable(dirname($envPath)), is_writable(dirname($envPath)) ? 'OK' : 'Not writable'],
     ];
 }
 
-// ── Handle form posts ────────────────────────────────────────
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    if ($step === 'configure') {
+// ── Handle form POST ──────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step === 'configure') {
 
-        if (!function_exists('exec') || !is_callable('exec')) {
-            $error = 'The exec() function is disabled on this server. Please enable it in php.ini to run the installer.';
-        } elseif (!file_exists($envExample)) {
-            $error = '.env.example file not found. Please make sure it exists in the project root.';
-        } else {
-            $fields = ['APP_NAME','APP_URL','DB_HOST','DB_PORT','DB_DATABASE','DB_USERNAME','DB_PASSWORD',
-                       'ADMIN_EMAIL','ADMIN_PASSWORD'];
-            $env = file_get_contents($envExample);
+    if (!file_exists($envExample)) {
+        $error = '.env.example not found in project root. Cannot continue.';
+    } else {
+        // 1. Build and write .env from .env.example
+        $fields = ['APP_NAME','APP_URL','DB_HOST','DB_PORT','DB_DATABASE','DB_USERNAME','DB_PASSWORD',
+                   'ADMIN_EMAIL','ADMIN_PASSWORD'];
+        $env = file_get_contents($envExample);
 
-            foreach ($fields as $f) {
-                $val = $_POST[$f] ?? '';
-                // Escape double quotes for .env format
-                $val = str_replace('"', '\\"', $val);
-                if (preg_match('/^' . $f . '=/m', $env)) {
-                    $env = preg_replace('/^' . $f . '=.*/m', $f . '="' . $val . '"', $env);
-                } else {
-                    $env .= "\n" . $f . '="' . $val . '"';
-                }
-            }
-
-            if (file_put_contents($envPath, $env) === false) {
-                $error = 'Could not write .env file. Please check write permissions on the project root.';
+        foreach ($fields as $f) {
+            $val = $_POST[$f] ?? '';
+            $val = str_replace('"', '\\"', $val);          // escape quotes for .env
+            if (preg_match('/^' . $f . '=/m', $env)) {
+                $env = preg_replace('/^' . $f . '=.*/m', $f . '="' . $val . '"', $env);
             } else {
-                // Detect the PHP binary used by this process
-                $phpBin = PHP_BINARY ?: 'php';
+                $env .= "\n" . $f . '="' . $val . '"';
+            }
+        }
 
-                chdir($root);
-                $output = [];
-                $exitCode = 0;
+        // 2. Generate APP_KEY (no exec needed — pure PHP)
+        $appKey = 'base64:' . base64_encode(random_bytes(32));
+        $env    = preg_replace('/^APP_KEY=.*/m', 'APP_KEY=' . $appKey, $env);
 
-                exec('"' . $phpBin . '" artisan key:generate --force 2>&1', $output, $exitCode);
-                exec('"' . $phpBin . '" artisan migrate --force 2>&1', $output, $exitCode);
-                exec('"' . $phpBin . '" artisan db:seed --force 2>&1', $output, $exitCode);
-                exec('"' . $phpBin . '" artisan storage:link 2>&1', $output, $exitCode);
+        if (file_put_contents($envPath, $env) === false) {
+            $error = 'Could not write .env — check write permissions on the project root.';
+        } else {
+            // 3. Bootstrap Laravel and run Artisan commands — no exec() needed
+            try {
+                require $root . '/vendor/autoload.php';
 
-                $imploded = implode("\n", $output);
+                $app = require $root . '/bootstrap/app.php';
 
-                // Check for genuine failures (exit code non-zero or fatal error keywords)
-                if ($exitCode !== 0 || stripos($imploded, 'fatal') !== false || stripos($imploded, 'exception') !== false) {
-                    $error = htmlspecialchars($imploded);
-                } else {
-                    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-                    $host   = $_SERVER['HTTP_HOST'];
-                    header('Location: ' . $scheme . '://' . $host . '/install/?step=success');
-                    exit;
+                /** @var \Illuminate\Contracts\Console\Kernel $artisan */
+                $artisan = $app->make(\Illuminate\Contracts\Console\Kernel::class);
+
+                $migrateCode = $artisan->call('migrate', ['--force' => true]);
+                if ($migrateCode !== 0) {
+                    throw new \RuntimeException('Migration failed. Check your database credentials and try again.');
                 }
+
+                $artisan->call('db:seed', ['--force' => true]);
+
+                // Storage symlink — use PHP symlink() instead of artisan storage:link
+                $storagePublic = $root . '/public/storage';
+                $storageTarget = $root . '/storage/app/public';
+                if (!file_exists($storagePublic) && !is_link($storagePublic)) {
+                    symlink($storageTarget, $storagePublic);
+                }
+
+                $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+                header('Location: ' . $scheme . '://' . $_SERVER['HTTP_HOST'] . '/install/?step=success');
+                exit;
+
+            } catch (\Throwable $e) {
+                $error = htmlspecialchars($e->getMessage());
             }
         }
     }
 }
 
-$reqs = checkRequirements();
+$reqs      = checkRequirements($envPath);
 $allPassed = array_reduce($reqs, fn($c, $r) => $c && $r[1], true);
 ?>
 <!DOCTYPE html>
@@ -134,15 +140,15 @@ input:focus{outline:none;border-color:#fa5a0d;box-shadow:0 0 0 3px rgba(250,90,1
   <ul class="req-list">
     <?php foreach ($reqs as $r): ?>
     <li>
-      <span><?= $r[0] ?></span>
-      <span class="<?= $r[1]?'ok':'fail' ?>"><?= $r[2] ?></span>
+      <span><?= htmlspecialchars($r[0]) ?></span>
+      <span class="<?= $r[1]?'ok':'fail' ?>"><?= htmlspecialchars($r[2]) ?></span>
     </li>
     <?php endforeach; ?>
   </ul>
   <?php if ($allPassed): ?>
     <a href="?step=configure" class="btn">Continue →</a>
   <?php else: ?>
-    <p style="color:#dc2626">Please fix the requirements above before continuing.</p>
+    <p style="color:#dc2626;margin-top:8px">Please fix the requirements above before continuing.</p>
   <?php endif; ?>
 
 <?php elseif ($step === 'configure'): ?>
@@ -151,18 +157,18 @@ input:focus{outline:none;border-color:#fa5a0d;box-shadow:0 0 0 3px rgba(250,90,1
   <form method="POST">
     <p class="section-title">Application</p>
     <div class="form-group"><label>App Name</label><input name="APP_NAME" value="Ostex Admin" required></div>
-    <div class="form-group"><label>App URL</label><input name="APP_URL" value="http://localhost:8000" required></div>
+    <div class="form-group"><label>App URL</label><input name="APP_URL" value="http://<?= htmlspecialchars($_SERVER['HTTP_HOST']) ?>" required></div>
 
     <p class="section-title">Database (MySQL)</p>
     <div class="form-group"><label>DB Host</label><input name="DB_HOST" value="127.0.0.1" required></div>
     <div class="form-group"><label>DB Port</label><input name="DB_PORT" value="3306" required></div>
     <div class="form-group"><label>DB Name</label><input name="DB_DATABASE" value="ostex_admin" required></div>
     <div class="form-group"><label>DB Username</label><input name="DB_USERNAME" value="root" required></div>
-    <div class="form-group"><label>DB Password</label><input name="DB_PASSWORD" type="password" value=""></div>
+    <div class="form-group"><label>DB Password</label><input name="DB_PASSWORD" type="password"></div>
 
     <p class="section-title">Admin Account</p>
     <div class="form-group"><label>Admin Email</label><input name="ADMIN_EMAIL" type="email" value="admin@ostex.com" required></div>
-    <div class="form-group"><label>Admin Password</label><input name="ADMIN_PASSWORD" type="password" value="password" required></div>
+    <div class="form-group"><label>Admin Password</label><input name="ADMIN_PASSWORD" type="password" placeholder="Min 8 characters" required></div>
 
     <button type="submit" class="btn">Install →</button>
   </form>
