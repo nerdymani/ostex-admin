@@ -4,28 +4,90 @@
  * Visit: http://yourdomain.com/install/
  */
 
-$root     = dirname(dirname(__DIR__));
-$envPath  = $root . '/.env';
+$root       = dirname(dirname(__DIR__));
+$envPath    = $root . '/.env';
 $envExample = $root . '/.env.example';
-$autoload = $root . '/vendor/autoload.php';
+$autoload   = $root . '/vendor/autoload.php';
 
 $step  = $_GET['step'] ?? 'requirements';
 $error = '';
 
+// ── Run a shell command using whichever function is available ──
+function runCommand(string $cmd): string {
+    $output = '';
+    if (function_exists('exec') && !in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))))) {
+        exec($cmd . ' 2>&1', $lines);
+        $output = implode("\n", $lines);
+    } elseif (function_exists('shell_exec')) {
+        $output = (string) shell_exec($cmd . ' 2>&1');
+    } elseif (function_exists('proc_open')) {
+        $desc = [1 => ['pipe','w'], 2 => ['pipe','w']];
+        $proc = proc_open($cmd, $desc, $pipes);
+        if (is_resource($proc)) {
+            $output  = stream_get_contents($pipes[1]);
+            $output .= stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            proc_close($proc);
+        }
+    } elseif (function_exists('passthru')) {
+        ob_start();
+        passthru($cmd . ' 2>&1');
+        $output = ob_get_clean();
+    } elseif (function_exists('system')) {
+        ob_start();
+        system($cmd . ' 2>&1');
+        $output = ob_get_clean();
+    }
+    return trim((string) $output);
+}
+
+function canRunCommands(): bool {
+    $disabled = array_map('trim', explode(',', ini_get('disable_functions')));
+    foreach (['exec','shell_exec','proc_open','passthru','system'] as $fn) {
+        if (function_exists($fn) && !in_array($fn, $disabled)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function findPhpBin(): string {
+    // Use the binary running this very process first
+    if (defined('PHP_BINARY') && PHP_BINARY) return PHP_BINARY;
+    foreach (['/usr/local/php83/bin/php', '/usr/local/php82/bin/php',
+              '/usr/bin/php83', '/usr/bin/php82', '/usr/bin/php8',
+              '/usr/bin/php', 'php'] as $candidate) {
+        if (@is_executable($candidate) || $candidate === 'php') return $candidate;
+    }
+    return 'php';
+}
+
+function findComposer(string $root): string {
+    $local = $root . '/composer.phar';
+    if (file_exists($local)) return findPhpBin() . ' ' . escapeshellarg($local);
+    foreach (['/usr/local/bin/composer', '/usr/bin/composer'] as $c) {
+        if (@is_executable($c)) return $c;
+    }
+    return 'composer';
+}
+
 // ── Requirements ─────────────────────────────────────────────
 function checkRequirements(string $envPath, string $autoload): array {
-    $vendorOk = file_exists($autoload);
+    $vendorOk  = file_exists($autoload);
+    $canRun    = canRunCommands();
 
     return [
-        ['PHP >= 8.2',   version_compare(PHP_VERSION, '8.2.0', '>='), PHP_VERSION],
-        ['PDO MySQL',    extension_loaded('pdo_mysql'),  extension_loaded('pdo_mysql')  ? 'OK' : 'Missing'],
-        ['OpenSSL',      extension_loaded('openssl'),    extension_loaded('openssl')    ? 'OK' : 'Missing'],
-        ['Mbstring',     extension_loaded('mbstring'),   extension_loaded('mbstring')   ? 'OK' : 'Missing'],
-        ['Tokenizer',    extension_loaded('tokenizer'),  extension_loaded('tokenizer')  ? 'OK' : 'Missing'],
-        ['JSON',         extension_loaded('json'),       extension_loaded('json')       ? 'OK' : 'Missing'],
-        ['Fileinfo',     extension_loaded('fileinfo'),   extension_loaded('fileinfo')   ? 'OK' : 'Missing'],
-        ['vendor/ folder', $vendorOk, $vendorOk ? 'OK' : 'Missing — upload the vendor/ folder or run: composer install'],
-        ['.env writable',  is_writable(dirname($envPath)), is_writable(dirname($envPath)) ? 'OK' : 'Not writable'],
+        ['PHP >= 8.2',      version_compare(PHP_VERSION, '8.2.0', '>='), PHP_VERSION],
+        ['PDO MySQL',       extension_loaded('pdo_mysql'),  extension_loaded('pdo_mysql')  ? 'OK' : 'Missing'],
+        ['OpenSSL',         extension_loaded('openssl'),    extension_loaded('openssl')    ? 'OK' : 'Missing'],
+        ['Mbstring',        extension_loaded('mbstring'),   extension_loaded('mbstring')   ? 'OK' : 'Missing'],
+        ['Tokenizer',       extension_loaded('tokenizer'),  extension_loaded('tokenizer')  ? 'OK' : 'Missing'],
+        ['JSON',            extension_loaded('json'),       extension_loaded('json')       ? 'OK' : 'Missing'],
+        ['Fileinfo',        extension_loaded('fileinfo'),   extension_loaded('fileinfo')   ? 'OK' : 'Missing'],
+        ['Shell commands',  $canRun,   $canRun    ? 'OK' : 'All disabled — contact your host'],
+        ['vendor/ or Composer', $vendorOk || $canRun, $vendorOk ? 'OK' : ($canRun ? 'Will run composer install automatically' : 'Missing')],
+        ['.env writable',   is_writable(dirname($envPath)), is_writable(dirname($envPath)) ? 'OK' : 'Not writable'],
     ];
 }
 
@@ -33,11 +95,12 @@ function checkRequirements(string $envPath, string $autoload): array {
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step === 'configure') {
 
     if (!file_exists($envExample)) {
-        $error = '.env.example not found in project root. Cannot continue.';
-    } elseif (!file_exists($autoload)) {
-        $error = 'vendor/autoload.php not found. Make sure vendor.zip is in the project root and ZipArchive is enabled, or upload the vendor/ folder directly.';
+        $error = '.env.example not found in project root.';
+    } elseif (!canRunCommands() && !file_exists($autoload)) {
+        $error = 'All PHP shell functions (exec, shell_exec, proc_open…) are disabled on this server AND vendor/ is missing. '
+               . 'Please ask your host to enable at least one shell function, or upload the vendor/ folder manually.';
     } else {
-        // 1. Build and write .env from .env.example
+        // 1. Build and write .env
         $fields = ['APP_NAME','APP_URL','DB_HOST','DB_PORT','DB_DATABASE','DB_USERNAME','DB_PASSWORD',
                    'ADMIN_EMAIL','ADMIN_PASSWORD'];
         $env = file_get_contents($envExample);
@@ -52,15 +115,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step === 'configure') {
             }
         }
 
-        // 2. Generate APP_KEY — pure PHP, no exec() needed
+        // 2. Generate APP_KEY with pure PHP
         $appKey = 'base64:' . base64_encode(random_bytes(32));
         $env    = preg_replace('/^APP_KEY=.*/m', 'APP_KEY=' . $appKey, $env);
 
         if (file_put_contents($envPath, $env) === false) {
             $error = 'Could not write .env — check write permissions on the project root.';
         } else {
-            // 3. Bootstrap Laravel and run migrations/seeders — no exec() needed
             try {
+                // 3. Run composer install if vendor is missing
+                if (!file_exists($autoload)) {
+                    $php      = findPhpBin();
+                    $composer = findComposer($root);
+                    $out = runCommand('cd ' . escapeshellarg($root) . ' && '
+                        . $composer . ' install --no-dev --optimize-autoloader --no-interaction');
+                    if (!file_exists($autoload)) {
+                        throw new \RuntimeException("composer install failed. Output:\n" . $out);
+                    }
+                }
+
+                // 4. Bootstrap Laravel — run migrations & seed
                 require $autoload;
 
                 $app     = require $root . '/bootstrap/app.php';
@@ -68,12 +142,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $step === 'configure') {
 
                 $exitCode = $artisan->call('migrate', ['--force' => true]);
                 if ($exitCode !== 0) {
-                    throw new \RuntimeException('Migration failed. Check your database credentials.');
+                    throw new \RuntimeException('Migration failed. Check your database credentials and try again.');
                 }
 
                 $artisan->call('db:seed', ['--force' => true]);
 
-                // Storage symlink — pure PHP, no exec() needed
+                // 5. Storage symlink — pure PHP
                 $storagePublic = $root . '/public/storage';
                 $storageTarget = $root . '/storage/app/public';
                 if (!file_exists($storagePublic) && !is_link($storagePublic)) {
@@ -116,6 +190,7 @@ h1{color:#0c214f;font-size:1.8rem;margin-bottom:4px}
 .req-list li span:first-child{flex-shrink:0}
 .req-list li span:last-child{text-align:right;word-break:break-word}
 .ok{color:#16a34a;font-weight:600}
+.warn{color:#d97706;font-weight:600}
 .fail{color:#dc2626;font-weight:600}
 .form-group{margin-bottom:16px}
 label{display:block;font-size:.85rem;font-weight:600;color:#374151;margin-bottom:4px}
@@ -144,10 +219,12 @@ input:focus{outline:none;border-color:#fa5a0d;box-shadow:0 0 0 3px rgba(250,90,1
 <?php if ($step === 'requirements'): ?>
   <h2 style="margin-bottom:16px">Step 1: Requirements</h2>
   <ul class="req-list">
-    <?php foreach ($reqs as $r): ?>
+    <?php foreach ($reqs as $r):
+        $cls = $r[1] ? 'ok' : (str_contains((string)$r[2], 'automatically') ? 'warn' : 'fail');
+    ?>
     <li>
       <span><?= htmlspecialchars($r[0]) ?></span>
-      <span class="<?= $r[1] ? 'ok' : 'fail' ?>"><?= htmlspecialchars((string)$r[2]) ?></span>
+      <span class="<?= $cls ?>"><?= htmlspecialchars((string)$r[2]) ?></span>
     </li>
     <?php endforeach; ?>
   </ul>
@@ -163,7 +240,7 @@ input:focus{outline:none;border-color:#fa5a0d;box-shadow:0 0 0 3px rgba(250,90,1
   <form method="POST">
     <p class="section-title">Application</p>
     <div class="form-group"><label>App Name</label><input name="APP_NAME" value="Ostex Admin" required></div>
-    <div class="form-group"><label>App URL</label><input name="APP_URL" value="<?= htmlspecialchars(( (!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?'https':'http').'://'.$_SERVER['HTTP_HOST']) ?>" required></div>
+    <div class="form-group"><label>App URL</label><input name="APP_URL" value="<?= htmlspecialchars(((!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?'https':'http').'://'.$_SERVER['HTTP_HOST']) ?>" required></div>
 
     <p class="section-title">Database (MySQL)</p>
     <div class="form-group"><label>DB Host</label><input name="DB_HOST" value="127.0.0.1" required></div>
