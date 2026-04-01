@@ -230,6 +230,11 @@ class InstallController extends Controller
             $this->createStorageLink();
 
             $steps[] = 'Finalizing installation...';
+            // Switch session & cache to database now that tables exist
+            $this->writeEnv([
+                'SESSION_DRIVER' => 'database',
+                'CACHE_STORE'    => 'database',
+            ]);
             file_put_contents(storage_path('app/.installed'), date('Y-m-d H:i:s'));
 
             if (file_exists($this->progressFile)) {
