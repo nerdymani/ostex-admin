@@ -1,0 +1,8 @@
+---
+deployment:
+  tasks:
+    - export COMPOSER_HOME="${HOME}/.composer"
+    - /usr/local/php83/bin/php /usr/local/cpanel/3rdparty/bin/composer install --no-dev --optimize-autoloader --no-interaction 2>&1
+    - /usr/local/php83/bin/php artisan key:generate --force
+    - /usr/local/php83/bin/php artisan config:clear
+    - /usr/local/php83/bin/php artisan view:clear
